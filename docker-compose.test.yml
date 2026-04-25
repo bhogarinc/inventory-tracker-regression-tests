@@ -1,0 +1,200 @@
+version: '3.8'
+
+services:
+  # PostgreSQL for FastAPI microservices
+  postgres:
+    image: postgres:16-alpine
+    container_name: inventory_tracker_postgres_test
+    environment:
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_pass
+      POSTGRES_DB: inventory_tracker_test
+      POSTGRES_MULTIPLE_DATABASES: auth_service_test,catalog_service_test,order_service_test
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_test_data:/var/lib/postgresql/data
+      - ./docker/postgres/init-multiple-databases.sh:/docker-entrypoint-initdb.d/init-multiple-databases.sh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test_user -d inventory_tracker_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - test_network
+
+  # MySQL for legacy Flask comparison
+  mysql:
+    image: mysql:8.0
+    container_name: inventory_tracker_mysql_test
+    environment:
+      MYSQL_ROOT_PASSWORD: root_pass
+      MYSQL_DATABASE: inventory_tracker_legacy
+      MYSQL_USER: legacy_user
+      MYSQL_PASSWORD: legacy_pass
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_test_data:/var/lib/mysql
+      - ./docker/mysql/legacy_schema.sql:/docker-entrypoint-initdb.d/legacy_schema.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - test_network
+
+  # Redis for caching/session tests
+  redis:
+    image: redis:7-alpine
+    container_name: inventory_tracker_redis_test
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - test_network
+
+  # Auth Service (FastAPI)
+  auth-service:
+    build:
+      context: ./services/auth
+      dockerfile: Dockerfile.test
+    container_name: inventory_tracker_auth_test
+    environment:
+      DATABASE_URL: postgresql://test_user:test_pass@postgres:5432/auth_service_test
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: test-secret-key-for-jwt-signing-only
+      JWT_ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 30
+    ports:
+      - "8001:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - test_network
+
+  # Catalog Service (FastAPI)
+  catalog-service:
+    build:
+      context: ./services/catalog
+      dockerfile: Dockerfile.test
+    container_name: inventory_tracker_catalog_test
+    environment:
+      DATABASE_URL: postgresql://test_user:test_pass@postgres:5432/catalog_service_test
+      REDIS_URL: redis://redis:6379/1
+      AUTH_SERVICE_URL: http://auth-service:8000
+    ports:
+      - "8002:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - test_network
+
+  # Order Service (FastAPI)
+  order-service:
+    build:
+      context: ./services/order
+      dockerfile: Dockerfile.test
+    container_name: inventory_tracker_order_test
+    environment:
+      DATABASE_URL: postgresql://test_user:test_pass@postgres:5432/order_service_test
+      REDIS_URL: redis://redis:6379/2
+      AUTH_SERVICE_URL: http://auth-service:8000
+      CATALOG_SERVICE_URL: http://catalog-service:8000
+    ports:
+      - "8003:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+      catalog-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - test_network
+
+  # Legacy Flask App (for comparison)
+  legacy-flask:
+    build:
+      context: ./legacy
+      dockerfile: Dockerfile
+    container_name: inventory_tracker_legacy_test
+    environment:
+      DATABASE_URI: mysql+pymysql://legacy_user:legacy_pass@mysql:3306/inventory_tracker_legacy
+      SECRET_KEY: legacy-test-secret-key
+    ports:
+      - "5000:5000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - test_network
+
+  # Test Runner
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: inventory_tracker_test_runner
+    environment:
+      AUTH_SERVICE_URL: http://auth-service:8000
+      CATALOG_SERVICE_URL: http://catalog-service:8000
+      ORDER_SERVICE_URL: http://order-service:8000
+      LEGACY_APP_URL: http://legacy-flask:5000
+      DATABASE_URL: postgresql://test_user:test_pass@postgres:5432/inventory_tracker_test
+      MYSQL_URL: mysql+pymysql://legacy_user:legacy_pass@mysql:3306/inventory_tracker_legacy
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - .:/app
+      - test_reports:/app/reports
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      catalog-service:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+      legacy-flask:
+        condition: service_started
+    networks:
+      - test_network
+    command: ["pytest", "-v", "--tb=short", "-m", "smoke"]
+
+volumes:
+  postgres_test_data:
+  mysql_test_data:
+  test_reports:
+
+networks:
+  test_network:
+    driver: bridge
